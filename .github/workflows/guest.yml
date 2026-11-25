@@ -1,0 +1,111 @@
+# lasso.elf from source at both precisions, each checked, then released under the commit's Go pseudo-version
+# (RFD66606-2312) on a push to main.
+name: guest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  GUEST_RUNTIME_SHA: 1d8341825ac6fcfa8b8b2a11ae908e5d6aa71b33
+  SYSROOT_SHA: 585de9e0cfe15fc14f9961083d857d609592de42
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        precision: [single, double]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: weft/3-interactor/lasso
+      - uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/contract-guest-runtime
+          ref: ${{ env.GUEST_RUNTIME_SHA }}
+          path: weft/2-contract/guest-runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/repository-riscv64-sysroot
+          ref: ${{ env.SYSROOT_SHA }}
+          path: weft/5-repository/riscv64-sysroot
+      - name: cmake, ninja and the llvm binutils from apt
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q cmake ninja-build llvm
+      - uses: prefix-dev/setup-pixi@v0.9.3
+        with:
+          manifest-path: weft/5-repository/riscv64-sysroot/pixi.toml
+          cache: false
+      - name: clang and lld from the sysroot's pixi environment
+        working-directory: weft/5-repository/riscv64-sysroot
+        run: |
+          echo "$PWD/.pixi/envs/default/bin" >> "$GITHUB_PATH"
+          .pixi/envs/default/bin/clang++ --print-targets | grep -q riscv64
+      - name: Build lasso.elf
+        working-directory: weft/3-interactor/lasso
+        env:
+          RISCV64_SYSROOT: ${{ github.workspace }}/weft/5-repository/riscv64-sysroot
+          BUILD_DIR: ${{ runner.temp }}/build
+          PRECISION: ${{ matrix.precision }}
+        run: ./build.sh
+      - name: The ELF is an rv64gc guest of the matrix precision, symbols kept, functions registered, no build paths
+        working-directory: weft/3-interactor/lasso
+        env:
+          PRECISION: ${{ matrix.precision }}
+        run: |
+          E=lasso.elf
+          case "$PRECISION" in single) variant="18000000" ;; double) variant="28000000" ;; esac
+          file "$E" | grep -q "UCB RISC-V"
+          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "53425856 $variant"
+          if llvm-readelf -A "$E" | grep -q "_v1p0"; then echo "lasso.elf uses the V extension"; exit 1; fi
+          llvm-nm "$E" | grep -q " T main\$" || { echo "no .symtab: was lasso.elf stripped with -s?"; exit 1; }
+          for f in lasso_snap lasso_redirect lasso_live_points lasso_check lasso_check_all lasso_check_names; do
+            strings "$E" | grep -qx "$f" || { echo "$f is not registered"; exit 1; }
+          done
+          test "$(strings "$E" | grep -c "$GITHUB_WORKSPACE")" = 0
+          cp "$E" "lasso.$PRECISION.elf"
+          sha256sum "lasso.$PRECISION.elf"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lasso-elf-${{ matrix.precision }}-${{ github.sha }}
+          path: weft/3-interactor/lasso/lasso.${{ matrix.precision }}.elf
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lasso-elf-*-${{ github.sha }}
+          path: elfs
+          merge-multiple: true
+      - name: The release, tagged with the commit's Go pseudo-version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          when=$(date -u -d "@$(git show -s --format=%ct "$GITHUB_SHA")" +%Y%m%d%H%M%S)
+          tag="v0.0.0-$when-${GITHUB_SHA:0:12}"
+          (cd elfs && sha256sum lasso.single.elf lasso.double.elf > SHA256SUMS && cat SHA256SUMS)
+          if gh release view "$tag" >/dev/null 2>&1; then echo "$tag exists"; exit 0; fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "lasso guest $tag, single and double precision" \
+            --notes "lasso.single.elf and lasso.double.elf built from $GITHUB_SHA; sha256 in SHA256SUMS." \
+            elfs/lasso.single.elf elfs/lasso.double.elf elfs/SHA256SUMS
