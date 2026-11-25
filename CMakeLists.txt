@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.16)
+project(interactor_lasso C CXX)
+
+if(NOT DEFINED GUEST_RUNTIME_ROOT)
+	get_filename_component(GUEST_RUNTIME_ROOT "${CMAKE_SOURCE_DIR}/../../2-contract/guest-runtime" ABSOLUTE)
+endif()
+if(NOT EXISTS "${GUEST_RUNTIME_ROOT}/cmake/guest_runtime.cmake")
+	message(FATAL_ERROR "no contract-guest-runtime checkout at GUEST_RUNTIME_ROOT=${GUEST_RUNTIME_ROOT}")
+endif()
+include(${GUEST_RUNTIME_ROOT}/cmake/guest_runtime.cmake)
+include(cmake/lasso.cmake)
